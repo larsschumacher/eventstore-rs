@@ -12,7 +12,7 @@ use crate::types::{self, Credentials, OperationError};
 use bytes::{buf::BufMutExt, BytesMut};
 use futures::channel::{mpsc, oneshot};
 use futures::sink::SinkExt;
-use futures::stream::StreamExt;
+use futures::stream::{Stream, StreamExt};
 use protobuf::{Chars, RepeatedField};
 use std::ops::Deref;
 use uuid::Uuid;
@@ -1087,9 +1087,8 @@ impl SubscribeToStream {
         mut self,
         creds_opt: Option<Credentials>,
         mut bus: mpsc::Sender<Msg>,
-    ) -> types::Subscription {
+    ) -> impl Stream<Item = types::ResolvedEvent> + Send + Unpin {
         let (mut respond, promise) = mpsc::channel(DEFAULT_BOUNDED_SIZE);
-        let bus_cloned = bus.clone();
 
         tokio::spawn(async move {
             let (mailbox, mut recv) = mpsc::channel(DEFAULT_BOUNDED_SIZE);
@@ -1103,7 +1102,7 @@ impl SubscribeToStream {
             )?;
             let sub_id = pkg.correlation;
             let _ = bus
-                .send(Msg::Transmit(Lifetime::KeepAlive(pkg), mailbox))
+                .send(Msg::Transmit(Lifetime::KeepAlive(pkg), mailbox.clone()))
                 .await;
 
             while let Some(msg) = recv.next().await {
@@ -1139,7 +1138,19 @@ impl SubscribeToStream {
                                     retry_count: 0,
                                 };
 
-                                let _ = respond.send(appeared).await;
+                                // If send failed it means the other end of this
+                                // channel has been dropped, meaning the user is no longer
+                                // interested into that subscription. So we notify the server
+                                // we want to drop the subscription.
+                                if respond.send(appeared).await.is_err() {
+                                    let pkg = Pkg::new(Cmd::UnsubscribeFromStream, sub_id);
+                                    let _ = bus
+                                        .send(Msg::Transmit(Lifetime::OneTime(pkg), mailbox))
+                                        .await;
+
+                                    info!("Subscription [{}] has been dropped by the user", sub_id);
+                                    break;
+                                }
                             }
 
                             Cmd::SubscriptionDropped => {
@@ -1173,16 +1184,21 @@ impl SubscribeToStream {
             Ok(()) as std::io::Result<()>
         });
 
-        types::Subscription {
-            receiver: promise,
-            sender: bus_cloned,
-        }
+        promise.filter_map(|resp| {
+            let ret = match resp {
+                types::SubEvent::Confirmed { .. } => None,
+                types::SubEvent::Dropped => None,
+                types::SubEvent::EventAppeared { event, .. } => Some(*event),
+            };
+
+            futures::future::ready(ret)
+        })
     }
 }
 
 enum CatchupLiveLoop {
     Continue,
-    Break,
+    Break(bool),
 }
 
 enum CatchupLoop<A> {
@@ -1390,14 +1406,13 @@ fn catchup_impl<C>(
     mut read_msg: <C as Catchup>::Msg,
     mut sub_msg: messages::SubscribeToStream,
     mut bus: mpsc::Sender<Msg>,
-) -> types::Subscription
+) -> impl Stream<Item = types::ResolvedEvent> + Send + Unpin
 where
     C: Catchup + std::marker::Sync + std::marker::Send + 'static,
 {
     use futures::stream::iter;
 
     let (mut respond, promise) = mpsc::channel(DEFAULT_BOUNDED_SIZE);
-    let bus_cloned = bus.clone();
 
     tokio::spawn(async move {
         let (mailbox, mut recv) = mpsc::channel(DEFAULT_BOUNDED_SIZE);
@@ -1441,7 +1456,14 @@ where
                             handle_catchup_sub(sub_id, &track, &resp, &mut respond, &mut mode)
                                 .await?;
 
-                        if let CatchupLiveLoop::Break = outcome {
+                        if let CatchupLiveLoop::Break(do_drop) = outcome {
+                            if do_drop {
+                                let pkg = Pkg::new(Cmd::UnsubscribeFromStream, sub_id);
+                                let _ = bus
+                                    .send(Msg::Transmit(Lifetime::OneTime(pkg), mailbox))
+                                    .await;
+                            }
+
                             break;
                         }
                     // I know I didn't do that check for other operations but considering in
@@ -1464,7 +1486,19 @@ where
                                         Ok(appeared)
                                     });
 
-                                    let _ = respond.send_all(&mut iter(events)).await;
+                                    // If send failed it means the other end of this
+                                    // channel has been dropped, meaning the user is no longer
+                                    // interested into that subscription. So we notify the server
+                                    // we want to drop the subscription.
+                                    if respond.send_all(&mut iter(events)).await.is_err() {
+                                        let pkg = Pkg::new(Cmd::UnsubscribeFromStream, sub_id);
+                                        let _ = bus
+                                            .send(Msg::Transmit(Lifetime::OneTime(pkg), mailbox))
+                                            .await;
+
+                                        info!("Catchup subscription [{}] has been dropped by the user", sub_id);
+                                        break;
+                                    }
 
                                     if let Some(next) = next_opt {
                                         mode = Mode::Catchup(next);
@@ -1500,6 +1534,15 @@ where
 
                             CatchupLoop::Break => {
                                 let _ = respond.send(types::SubEvent::Dropped).await;
+                                let pkg = Pkg::new(Cmd::UnsubscribeFromStream, sub_id);
+                                let _ = bus
+                                    .send(Msg::Transmit(Lifetime::OneTime(pkg), mailbox))
+                                    .await;
+
+                                info!(
+                                    "Catchup subscription [{}] has been dropped by the user",
+                                    sub_id
+                                );
 
                                 break;
                             }
@@ -1553,10 +1596,15 @@ where
         Ok(()) as std::io::Result<()>
     });
 
-    types::Subscription {
-        receiver: promise,
-        sender: bus_cloned,
-    }
+    promise.filter_map(|resp| {
+        let ret = match resp {
+            types::SubEvent::Confirmed { .. } => None,
+            types::SubEvent::Dropped => None,
+            types::SubEvent::EventAppeared { event, .. } => Some(*event),
+        };
+
+        futures::future::ready(ret)
+    })
 }
 
 async fn handle_catchup_sub<T: Track>(
@@ -1599,7 +1647,19 @@ async fn handle_catchup_sub<T: Track>(
                     retry_count: 0,
                 };
 
-                let _ = respond.send(appeared).await;
+                // If send failed it means the other end of this
+                // channel has been dropped, meaning the user is no longer
+                // interested into that subscription. So we notify the server
+                // we want to drop the subscription.
+                if respond.send(appeared).await.is_err() {
+                    info!(
+                        "Catchup subscription [{}] has been dropped by the user",
+                        sub_id
+                    );
+
+                    return Ok(CatchupLiveLoop::Break(true));
+                }
+
                 *mode = Mode::Live(offset);
             }
         }
@@ -1609,7 +1669,7 @@ async fn handle_catchup_sub<T: Track>(
 
             let _ = respond.send(types::SubEvent::Dropped).await;
 
-            return Ok(CatchupLiveLoop::Break);
+            return Ok(CatchupLiveLoop::Break(false));
         }
 
         _ => {
@@ -1636,7 +1696,7 @@ impl CatchupRegularSubscription {
         self,
         creds_opt: Option<Credentials>,
         bus: mpsc::Sender<Msg>,
-    ) -> types::Subscription {
+    ) -> impl Stream<Item = types::ResolvedEvent> + Send + Unpin {
         let track = RegularTrack {
             stream: self.stream,
         };
@@ -1676,7 +1736,7 @@ impl CatchupAllSubscription {
         self,
         creds_opt: Option<Credentials>,
         bus: mpsc::Sender<Msg>,
-    ) -> types::Subscription {
+    ) -> impl Stream<Item = types::ResolvedEvent> + Send + Unpin {
         let track = AllTrack();
         let mut sub_msg = messages::SubscribeToStream::new();
         let mut read_msg = messages::ReadAllEvents::new();

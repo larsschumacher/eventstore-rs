@@ -1196,9 +1196,9 @@ impl SubscribeToStream {
         }
     }
 
-    /// Sends the volatile subscription request to the server asynchronously
-    /// even if the subscription is available right away.
-    pub fn execute(self) -> types::Subscription {
+    /// Sends the volatile subscription request to the server. If the stream is dropped,
+    /// the subscription will automatically unsubscribe.
+    pub fn execute(self) -> impl Stream<Item = types::ResolvedEvent> + Send + Unpin {
         let mut op = operations::SubscribeToStream::new();
 
         op.set_event_stream_id(self.stream_id);
@@ -1292,7 +1292,7 @@ impl RegularCatchupSubscribe {
     /// Preforms the catching up phase of the subscription asynchronously. When
     /// it will reach the head of stream, the command will emit a volatile
     /// subscription request.
-    pub fn execute(self) -> types::Subscription {
+    pub fn execute(self) -> impl Stream<Item = types::ResolvedEvent> + Send + Unpin {
         let op = operations::CatchupRegularSubscription {
             require_master: self.require_master,
             batch_size: self.batch_size,
@@ -1365,7 +1365,7 @@ impl<'a> AllCatchupSubscribe {
     /// Preforms the catching up phase of the subscription asynchronously. When
     /// it will reach the head of stream, the command will emit a volatile
     /// subscription request.
-    pub async fn execute(self) -> types::Subscription {
+    pub async fn execute(self) -> impl Stream<Item = types::ResolvedEvent> + Send + Unpin {
         let op = operations::CatchupAllSubscription {
             require_master: self.require_master,
             batch_size: self.batch_size,

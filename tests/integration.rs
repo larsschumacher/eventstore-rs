@@ -417,19 +417,27 @@ pub mod tcp {
     async fn test_volatile_subscription(
         connection: &eventstore::Connection,
     ) -> Result<(), Box<dyn Error>> {
+        use futures::stream::StreamExt;
+
         let stream_id = fresh_stream_id("volatile");
-        let sub = connection.subcribe_to_stream(stream_id.as_str()).execute();
+        let mut sub = connection.subcribe_to_stream(stream_id.as_str()).execute();
         let events = generate_events("volatile-test", 3);
-        // let confirmation = sub.confirmation();
 
         let (tx, recv) = oneshot::channel();
 
         tokio::spawn(async move {
-            let test_res = sub.consume_async(TestSub { count: 0, max: 3 }).await;
-            tx.send(test_res).unwrap();
-        });
+            let mut count = 0usize;
 
-        // confirmation.await;
+            while let Some(_) = sub.next().await {
+                count += 1;
+
+                if count == 3 {
+                    break;
+                }
+            }
+
+            tx.send(count).unwrap();
+        });
 
         let _ = connection
             .write_events(stream_id)
@@ -437,12 +445,12 @@ pub mod tcp {
             .execute()
             .await?;
 
-        let test_sub = recv.await?;
+        let count = recv.await?;
 
         assert_eq!(
-            test_sub.count, 3,
+            count, 3,
             "We are testing proper state after volatile subscription: got {} expected {}.",
-            test_sub.count, 3
+            count, 3
         );
 
         Ok(())
@@ -456,6 +464,8 @@ pub mod tcp {
     async fn test_catchup_subscription(
         connection: &eventstore::Connection,
     ) -> Result<(), Box<dyn Error>> {
+        use futures::stream::StreamExt;
+
         let stream_id = fresh_stream_id("catchup");
         let events_before = generate_events("catchup-test-before", 3);
         let events_after = generate_events("catchup-test-after", 3);
@@ -466,15 +476,24 @@ pub mod tcp {
             .execute()
             .await?;
 
-        let sub = connection
+        let mut sub = connection
             .subscribe_to_stream_from(stream_id.clone())
             .execute();
 
         let (tx, recv) = oneshot::channel();
 
         tokio::spawn(async move {
-            let test_res = sub.consume_async(TestSub { count: 0, max: 6 }).await;
-            tx.send(test_res).unwrap();
+            let mut count = 0usize;
+
+            while let Some(_) = sub.next().await {
+                count += 1;
+
+                if count == 6 {
+                    break;
+                }
+            }
+
+            tx.send(count).unwrap();
         });
 
         let _ = connection
@@ -483,12 +502,12 @@ pub mod tcp {
             .execute()
             .await?;
 
-        let test_sub = recv.await?;
+        let count = recv.await?;
 
         assert_eq!(
-            test_sub.count, 6,
+            count, 6,
             "We are testing proper state after catchup subscription: got {} expected {}.",
-            test_sub.count, 3
+            count, 6
         );
 
         Ok(())
@@ -498,13 +517,20 @@ pub mod tcp {
     // we did in `test_catchup_subscription`
     // h
     async fn test_catchup_all_subscription(connection: &eventstore::Connection) {
-        let sub = connection.subscribe_to_all_from().execute().await;
-        let tmp = sub.consume_async(TestSub { count: 0, max: 10 }).await;
+        use futures::stream::StreamExt;
 
-        assert_eq!(
-            tmp.count, 10,
-            "We are testing proper state after $all catchup"
-        );
+        let mut sub = connection.subscribe_to_all_from().execute().await;
+        let mut count = 0usize;
+
+        while let Some(_) = sub.next().await {
+            count += 1;
+
+            if count == 10 {
+                break;
+            }
+        }
+
+        assert_eq!(count, 10, "We are testing proper state after $all catchup");
     }
 
     // We test we can successfully create a persistent subscription.
