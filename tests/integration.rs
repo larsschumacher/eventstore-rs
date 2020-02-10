@@ -519,7 +519,7 @@ pub mod tcp {
     async fn test_catchup_all_subscription(connection: &eventstore::Connection) {
         use futures::stream::StreamExt;
 
-        let mut sub = connection.subscribe_to_all_from().execute().await;
+        let mut sub = connection.subscribe_to_all_from().execute();
         let mut count = 0usize;
 
         while let Some(_) = sub.next().await {

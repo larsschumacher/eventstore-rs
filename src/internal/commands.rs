@@ -1365,7 +1365,7 @@ impl<'a> AllCatchupSubscribe {
     /// Preforms the catching up phase of the subscription asynchronously. When
     /// it will reach the head of stream, the command will emit a volatile
     /// subscription request.
-    pub async fn execute(self) -> impl Stream<Item = types::ResolvedEvent> + Send + Unpin {
+    pub fn execute(self) -> impl Stream<Item = types::ResolvedEvent> + Send + Unpin {
         let op = operations::CatchupAllSubscription {
             require_master: self.require_master,
             batch_size: self.batch_size,
