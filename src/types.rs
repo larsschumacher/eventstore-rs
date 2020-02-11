@@ -335,17 +335,11 @@ fn decode_bytes_error(err: BytesError) -> ::std::io::Error {
     ::std::io::Error::new(::std::io::ErrorKind::Other, format!("BytesError {}", err))
 }
 
-fn uuid_from_guid(b: &[u8]) -> Result<Uuid, BytesError> {
-    Uuid::from_slice(&[
-        b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13],
-        b[14], b[15],
-    ])
-}
 
 impl RecordedEvent {
     pub(crate) fn new(mut event: messages::EventRecord) -> ::std::io::Result<RecordedEvent> {
         let event_stream_id = event.take_event_stream_id().deref().to_owned();
-        let event_id = uuid_from_guid(event.get_event_id()).map_err(decode_bytes_error)?;
+        let event_id = guid::to_uuid(event.get_event_id()).map_err(decode_bytes_error)?;
         let event_number = event.get_event_number();
         let event_type = event.take_event_type().deref().to_owned();
         let data = event.take_data();
@@ -732,15 +726,6 @@ pub struct EventData {
     metadata_payload_opt: Option<Payload>,
 }
 
-fn uuid_to_guid(uuid: Uuid) -> Bytes {
-    let b = uuid.as_bytes();
-
-    Bytes::from(vec![
-        b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13],
-        b[14], b[15],
-    ])
-}
-
 impl EventData {
     /// Creates an event with a JSON payload.
     pub fn json<P, S>(event_type: S, payload: P) -> serde_json::Result<EventData>
@@ -809,7 +794,7 @@ impl EventData {
         let mut new_event = messages::NewEvent::new();
         let id = self.id_opt.unwrap_or_else(Uuid::new_v4);
 
-        new_event.set_event_id(uuid_to_guid(id));
+        new_event.set_event_id(guid::from_uuid(id));
 
         match self.payload {
             Payload::Json(bin) => {
@@ -1610,6 +1595,57 @@ impl GossipSeedClusterSettings {
         GossipSeedClusterSettings {
             max_discover_attempts: max_attempt,
             ..self
+        }
+    }
+}
+
+mod guid {
+    use uuid::{Uuid, BytesError};
+    use bytes::Bytes;
+
+    pub(crate) fn from_uuid(uuid: Uuid) -> Bytes {
+        let b = uuid.as_bytes();
+
+        Bytes::from(vec![
+            b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13],
+            b[14], b[15],
+        ])
+    }
+
+    pub(crate) fn to_uuid(b: &[u8]) -> Result<Uuid, BytesError> {
+        Uuid::from_slice(&[
+            b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13],
+            b[14], b[15],
+        ])
+    }
+
+    #[cfg(test)]
+    mod test {
+        use bytes::Bytes;
+        use uuid::Uuid;
+
+        #[test]
+        fn test_from_uuid() {
+            let uuid = Uuid::from_bytes([
+                60, 213, 58, 216, 84, 211, 79, 74, 177, 22, 31, 9, 149, 122, 243, 48,
+            ]);
+            let expected_guid = Bytes::from_static(&[
+                216, 58, 213, 60, 211, 84, 74, 79, 177, 22, 31, 9, 149, 122, 243, 48,
+            ]);
+
+            assert_eq!(super::from_uuid(uuid), expected_guid);
+        }
+
+        #[test]
+        fn test_to_uuid() {
+            let guid = &[
+                216, 58, 213, 60, 211, 84, 74, 79, 177, 22, 31, 9, 149, 122, 243, 48,
+            ];
+            let expected_uuid = Uuid::from_bytes([
+                60, 213, 58, 216, 84, 211, 79, 74, 177, 22, 31, 9, 149, 122, 243, 48,
+            ]);
+
+            assert_eq!(super::to_uuid(guid), Ok(expected_uuid));
         }
     }
 }
