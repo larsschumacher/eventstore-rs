@@ -1,13 +1,13 @@
 [package]
 name = "eventstore"
-version = "0.8.0"
+version = "0.7.2"
 authors = ["Yorick Laupa <yo.eight@gmail.com>"]
 edition = "2018"
 
 # Uncomment if you want to update messages.rs code-gen.
 # We disabled codegen.rs because it requires having `protoc` installed on your machine
 # in order to build that library.
-build = "codegen.rs"
+# build = "codegen.rs"
 
 license = "MIT"
 description = "GetEventStore TCP client"

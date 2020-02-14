@@ -5,11 +5,9 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::ops::Deref;
 use std::time::Duration;
 
-use bytes::{BufMut, Bytes, BytesMut};
-use futures::channel::mpsc::{Receiver, Sender};
-use futures::channel::oneshot;
+use bytes::Bytes;
+use futures::channel::mpsc::Sender;
 use futures::sink::SinkExt;
-use futures::stream::{iter, StreamExt};
 use protobuf::Chars;
 use serde::de::Deserialize;
 use serde::ser::Serialize;
@@ -20,6 +18,7 @@ use crate::internal::command::Cmd;
 use crate::internal::messages;
 use crate::internal::messaging::Msg;
 use crate::internal::package::Pkg;
+use futures::Stream;
 
 #[derive(Debug, Clone)]
 pub enum OperationError {
@@ -338,7 +337,7 @@ fn decode_bytes_error(err: BytesError) -> ::std::io::Error {
 impl RecordedEvent {
     pub(crate) fn new(mut event: messages::EventRecord) -> ::std::io::Result<RecordedEvent> {
         let event_stream_id = event.take_event_stream_id().deref().to_owned();
-        let event_id = Uuid::from_slice(event.get_event_id()).map_err(decode_bytes_error)?;
+        let event_id = guid::to_uuid(event.get_event_id()).map_err(decode_bytes_error)?;
         let event_number = event.get_event_number();
         let event_type = event.take_event_type().deref().to_owned();
         let data = event.take_data();
@@ -793,7 +792,7 @@ impl EventData {
         let mut new_event = messages::NewEvent::new();
         let id = self.id_opt.unwrap_or_else(Uuid::new_v4);
 
-        new_event.set_event_id(Bytes::from(id.as_bytes().to_vec()));
+        new_event.set_event_id(guid::from_uuid(id));
 
         match self.payload {
             Payload::Json(bin) => {
@@ -972,135 +971,103 @@ pub struct StreamAcl {
     pub meta_write_roles: Option<Vec<String>>,
 }
 
-/// Outcome to returns when a subscription dispatches an event.
-#[derive(Debug, PartialEq, Eq)]
-pub enum OnEventAppeared {
-    /// States to continue processing the subscription.
-    Continue,
-
-    /// Asks to drop the subscription.
-    Drop,
+/// Read part of a persistent subscription, isomorphic to a stream of events.
+pub struct PersistentSubRead {
+    pub(crate) inner: Box<dyn Stream<Item = PersistentSubEvent> + Send + Unpin>,
 }
 
-struct NakedEvents {
-    ids: Vec<Uuid>,
-    action: NakAction,
-    message: Chars,
-}
+impl PersistentSubRead {
+    pub fn into_inner(self) -> Box<dyn Stream<Item = PersistentSubEvent> + Send + Unpin> {
+        self.inner
+    }
 
-/// Set of operations supported when consumming events from a subscription.
-/// Most of those operations are only available for persistent subscription,
-/// and will be no-op when used with either volatile or catchup subscriptions.
-///
-/// * Notes
-/// All the buffers used by `SubscriptionEnv` will get flushed once the instance
-/// goes out of scope.
-pub trait SubscriptionEnv {
-    /// Add an event id to ack list.
-    ///
-    /// * Notes
-    /// For persistent subscription only.
-    fn push_ack(&mut self, _: Uuid);
+    pub async fn read_next(&mut self) -> Option<PersistentSubEvent> {
+        use futures::stream::StreamExt;
 
-    /// Add an event ids to the nak list. It asks for `Vec` so you can have
-    /// different `NakAction` for different event set.
-    ///
-    /// * Notes
-    /// For persistent subscription only.
-    fn push_nak_with_message<S: AsRef<str>>(&mut self, _: Vec<Uuid>, _: NakAction, _: S);
-
-    /// Get the number of time that event has been retried.
-    ///
-    /// * Notes
-    /// For persistent subscription only.
-    fn current_event_retry_count(&self) -> usize;
-
-    /// Like `push_nak_with_message` but uses an empty message for `NakAction`.
-    fn push_nak(&mut self, ids: Vec<Uuid>, action: NakAction) {
-        self.push_nak_with_message(ids, action, "");
+        self.inner.next().await
     }
 }
 
-struct NoopSubscriptionEnv;
-
-impl SubscriptionEnv for NoopSubscriptionEnv {
-    fn push_ack(&mut self, _: Uuid) {}
-    fn push_nak_with_message<S: AsRef<str>>(&mut self, _: Vec<Uuid>, _: NakAction, _: S) {}
-    fn current_event_retry_count(&self) -> usize {
-        0
-    }
+/// Write part of a persistent subscription. Used to either acknowledge or report error on a persistent
+/// subscription.
+pub struct PersistentSubWrite {
+    pub(crate) sub_id: protobuf::Chars,
+    pub(crate) sender: Sender<Msg>,
 }
 
-struct PersistentSubscriptionEnv {
-    acks: Vec<Uuid>,
-    naks: Vec<NakedEvents>,
-    retry_count: usize,
-}
-
-impl PersistentSubscriptionEnv {
-    fn new(retry_count: usize) -> PersistentSubscriptionEnv {
-        PersistentSubscriptionEnv {
-            acks: Vec::new(),
-            naks: Vec::new(),
-            retry_count,
-        }
-    }
-}
-
-impl SubscriptionEnv for PersistentSubscriptionEnv {
-    fn push_ack(&mut self, id: Uuid) {
-        self.acks.push(id);
-    }
-
-    fn push_nak_with_message<S: AsRef<str>>(
-        &mut self,
-        ids: Vec<Uuid>,
-        action: NakAction,
-        message: S,
-    ) {
-        let naked = NakedEvents {
-            ids,
-            action,
-            message: message.as_ref().into(),
-        };
-
-        self.naks.push(naked);
-    }
-
-    fn current_event_retry_count(&self) -> usize {
-        self.retry_count
-    }
-}
-
-/// Represents the lifecycle of a subscription.
-pub trait SubscriptionConsumer {
-    /// Called when the subscription has been confirmed by the server.
-    /// Usually, it's the first out of all callbacks to be called.
-    ///
-    /// * Notes
-    /// It's possible to have `when_event_appeared` called before
-    /// `when_confirmed` for catchup subscriptions as catchup subscriptions
-    /// mixes several operations at the same time.
-    fn when_confirmed(&mut self, _id: Uuid, _last_commit_position: i64, _last_event_number: i64) {}
-
-    /// Called when the subscription has received an event from the server.
-    fn when_event_appeared<E>(&mut self, _: &mut E, _: Box<ResolvedEvent>) -> OnEventAppeared
+impl PersistentSubWrite {
+    /// Acknowledges a batch of event ids have been processed successfully.
+    async fn ack<I>(&mut self, ids: I)
     where
-        E: SubscriptionEnv;
+        I: Iterator<Item = Uuid>,
+    {
+        let mut msg = messages::PersistentSubscriptionAckEvents::new();
 
-    /// Called when the subscrition has been dropped whether by the server or
-    /// the user themself.
-    fn when_dropped(&mut self) {}
+        msg.set_processed_event_ids(ids.map(guid::from_uuid).collect());
+        msg.set_subscription_id(self.sub_id.clone());
+
+        let pkg = Pkg::from_message(Cmd::PersistentSubscriptionAckEvents, None, &msg)
+            .expect("We expect serializing ack message will succeed");
+
+        let _ = self.sender.send(Msg::Send(pkg)).await;
+    }
+
+    /// Acknowledges a batch of event ids has failed during process.
+    async fn nak<I, S>(&mut self, ids: I, action: NakAction, reason: S)
+    where
+        I: Iterator<Item = Uuid>,
+        S: AsRef<str>,
+    {
+        let mut msg = messages::PersistentSubscriptionNakEvents::new();
+
+        msg.set_processed_event_ids(ids.map(guid::from_uuid).collect());
+        msg.set_subscription_id(self.sub_id.clone());
+        msg.set_message(reason.as_ref().into());
+        msg.set_action(action.build_internal_nak_action());
+
+        let pkg = Pkg::from_message(Cmd::PersistentSubscriptionNakEvents, None, &msg)
+            .expect("We expect serializing nak message will succeed");
+
+        let _ = self.sender.send(Msg::Send(pkg)).await;
+    }
+
+    /// Acknowledges a batch of `ResolvedEvent`s has been processed successfully.
+    pub async fn ack_events<I>(&mut self, events: I)
+    where
+        I: Iterator<Item = PersistentSubEvent>,
+    {
+        self.ack(events.map(|event| event.inner.get_original_event().event_id))
+            .await
+    }
+
+    /// Acknowledges a batch of `ResolvedEvent`'s has failed during process.
+    pub async fn nak_events<I, S>(&mut self, events: I, action: NakAction, reason: S)
+    where
+        I: Iterator<Item = PersistentSubEvent>,
+        S: AsRef<str>,
+    {
+        let ids = events.map(|event| event.inner.get_original_event().event_id);
+
+        self.nak(ids, action, reason).await
+    }
+
+    /// Acknowledges a `ResolvedEvent` has been processed successfully.
+    pub async fn ack_event(&mut self, event: PersistentSubEvent) {
+        self.ack_events(vec![event].into_iter()).await
+    }
+
+    /// Acknowledges a `ResolvedEvent` has failed during process.
+    pub async fn nak_event<S>(&mut self, event: PersistentSubEvent, action: NakAction, reason: S)
+    where
+        S: AsRef<str>,
+    {
+        self.nak_events(vec![event].into_iter(), action, reason)
+            .await
+    }
 }
 
 pub(crate) enum SubEvent {
-    Confirmed {
-        id: Uuid,
-        last_commit_position: i64,
-        last_event_number: i64,
-        // If defined, it means we are in a persistent subscription.
-        persistent_id: Option<String>,
-    },
+    Confirmed,
 
     EventAppeared {
         event: Box<ResolvedEvent>,
@@ -1110,35 +1077,10 @@ pub(crate) enum SubEvent {
     Dropped,
 }
 
-struct State<A: SubscriptionConsumer> {
-    consumer: A,
-    confirmation_id: Option<Uuid>,
-    persistent_id: Option<String>,
-    confirmation_requests: Vec<oneshot::Sender<()>>,
-    buffer: BytesMut,
-}
-
-impl<A: SubscriptionConsumer> State<A> {
-    fn new(consumer: A) -> State<A> {
-        State {
-            consumer,
-            confirmation_id: None,
-            persistent_id: None,
-            confirmation_requests: Vec::new(),
-            buffer: BytesMut::new(),
-        }
-    }
-
-    fn drain_requests(&mut self) {
-        for req in self.confirmation_requests.drain(..) {
-            let _ = req.send(());
-        }
-    }
-}
-
-enum OnEvent {
-    Continue,
-    Stop,
+#[derive(Debug)]
+pub struct PersistentSubEvent {
+    pub inner: ResolvedEvent,
+    pub retry_count: usize,
 }
 
 /// Gathers every possible Nak actions.
@@ -1169,141 +1111,6 @@ impl NakAction {
             NakAction::Park => messages::PersistentSubscriptionNakEvents_NakAction::Park,
             NakAction::Stop => messages::PersistentSubscriptionNakEvents_NakAction::Stop,
         }
-    }
-}
-
-async fn on_event<C>(sender: &mut Sender<Msg>, state: &mut State<C>, event: SubEvent) -> OnEvent
-where
-    C: SubscriptionConsumer,
-{
-    match event {
-        SubEvent::Confirmed {
-            id,
-            last_commit_position,
-            last_event_number,
-            persistent_id,
-        } => {
-            state.confirmation_id = Some(id);
-            state.persistent_id = persistent_id;
-            state.drain_requests();
-            state
-                .consumer
-                .when_confirmed(id, last_commit_position, last_event_number);
-        }
-
-        SubEvent::EventAppeared { event, retry_count } => {
-            let decision = match state.persistent_id.as_ref() {
-                Some(sub_id) => {
-                    let mut env = PersistentSubscriptionEnv::new(retry_count);
-                    let decision = state.consumer.when_event_appeared(&mut env, event);
-
-                    let acks = env.acks;
-
-                    if !acks.is_empty() {
-                        let mut msg = messages::PersistentSubscriptionAckEvents::new();
-
-                        msg.set_subscription_id(sub_id.as_str().into());
-
-                        for id in acks {
-                            // Reserves enough to store an UUID (which is 16 bytes long).
-                            state.buffer.reserve(16);
-                            state.buffer.put_slice(id.as_bytes());
-
-                            let bytes = state.buffer.split().freeze();
-                            msg.mut_processed_event_ids().push(bytes);
-                        }
-
-                        let pkg =
-                            Pkg::from_message(Cmd::PersistentSubscriptionAckEvents, None, &msg)
-                                .unwrap();
-
-                        let _ = sender.send(Msg::Send(pkg)).await;
-                    }
-
-                    let naks = env.naks;
-                    let mut pkgs = Vec::new();
-
-                    if !naks.is_empty() {
-                        for naked in naks {
-                            let mut msg = messages::PersistentSubscriptionNakEvents::new();
-                            let mut bytes_vec = Vec::with_capacity(naked.ids.len());
-
-                            msg.set_subscription_id(sub_id.as_str().into());
-
-                            for id in naked.ids {
-                                // Reserves enough to store an UUID (which is 16 bytes long).
-                                state.buffer.reserve(16);
-                                state.buffer.put_slice(id.as_bytes());
-
-                                let bytes = state.buffer.split().freeze();
-                                bytes_vec.push(bytes);
-                            }
-
-                            msg.set_processed_event_ids(bytes_vec);
-                            msg.set_message(naked.message);
-                            msg.set_action(naked.action.build_internal_nak_action());
-
-                            let pkg =
-                                Pkg::from_message(Cmd::PersistentSubscriptionAckEvents, None, &msg)
-                                    .unwrap();
-
-                            pkgs.push(pkg);
-                        }
-
-                        let pkgs = pkgs.into_iter().map(|pkg| Ok(Msg::Send(pkg)));
-                        let _ = sender.send_all(&mut iter(pkgs)).await;
-                    }
-
-                    decision
-                }
-
-                None => state
-                    .consumer
-                    .when_event_appeared(&mut NoopSubscriptionEnv, event),
-            };
-
-            if let OnEventAppeared::Drop = decision {
-                let id = state
-                    .confirmation_id
-                    .expect("impossible situation when dropping subscription");
-                let pkg = Pkg::new(Cmd::UnsubscribeFromStream, id);
-
-                let _ = sender.send(Msg::Send(pkg)).await;
-                return OnEvent::Stop;
-            }
-        }
-
-        SubEvent::Dropped => {
-            state.consumer.when_dropped();
-            state.drain_requests();
-        }
-    };
-
-    OnEvent::Continue
-}
-
-/// Represents the common operations supported by a subscription.
-pub struct Subscription {
-    pub(crate) receiver: Receiver<SubEvent>,
-    pub(crate) sender: Sender<Msg>,
-}
-
-impl Subscription {
-    /// Consumes asynchronously the events comming from a subscription.
-    pub async fn consume_async<C>(mut self, init: C) -> C
-    where
-        C: SubscriptionConsumer,
-    {
-        let mut sender = self.sender.clone();
-        let mut state = State::new(init);
-
-        while let Some(event) = self.receiver.next().await {
-            if let OnEvent::Stop = on_event(&mut sender, &mut state, event).await {
-                break;
-            }
-        }
-
-        state.consumer
     }
 }
 
@@ -1594,6 +1401,57 @@ impl GossipSeedClusterSettings {
         GossipSeedClusterSettings {
             max_discover_attempts: max_attempt,
             ..self
+        }
+    }
+}
+
+mod guid {
+    use bytes::Bytes;
+    use uuid::{BytesError, Uuid};
+
+    pub(crate) fn from_uuid(uuid: Uuid) -> Bytes {
+        let b = uuid.as_bytes();
+
+        Bytes::from(vec![
+            b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13],
+            b[14], b[15],
+        ])
+    }
+
+    pub(crate) fn to_uuid(b: &[u8]) -> Result<Uuid, BytesError> {
+        Uuid::from_slice(&[
+            b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13],
+            b[14], b[15],
+        ])
+    }
+
+    #[cfg(test)]
+    mod test {
+        use bytes::Bytes;
+        use uuid::Uuid;
+
+        #[test]
+        fn test_from_uuid() {
+            let uuid = Uuid::from_bytes([
+                60, 213, 58, 216, 84, 211, 79, 74, 177, 22, 31, 9, 149, 122, 243, 48,
+            ]);
+            let expected_guid = Bytes::from_static(&[
+                216, 58, 213, 60, 211, 84, 74, 79, 177, 22, 31, 9, 149, 122, 243, 48,
+            ]);
+
+            assert_eq!(super::from_uuid(uuid), expected_guid);
+        }
+
+        #[test]
+        fn test_to_uuid() {
+            let guid = &[
+                216, 58, 213, 60, 211, 84, 74, 79, 177, 22, 31, 9, 149, 122, 243, 48,
+            ];
+            let expected_uuid = Uuid::from_bytes([
+                60, 213, 58, 216, 84, 211, 79, 74, 177, 22, 31, 9, 149, 122, 243, 48,
+            ]);
+
+            assert_eq!(super::to_uuid(guid), Ok(expected_uuid));
         }
     }
 }
